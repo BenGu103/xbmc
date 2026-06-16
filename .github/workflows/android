@@ -1,0 +1,90 @@
+name: Build Kodi Android (aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_package:
+        description: "Application id (reverse-domain)"
+        required: true
+        default: "tv.ateret.kodi"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SDK_ROOT: ${{ github.workspace }}/android-tools/android-sdk-linux
+      TARBALLS: ${{ github.workspace }}/android-tools/xbmc-tarballs
+      DEPENDS:  ${{ github.workspace }}/android-tools/xbmc-depends
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set application id
+        run: |
+          sed -i -E "s|^APP_PACKAGE .*|APP_PACKAGE ${{ github.event.inputs.app_package }}|" version.txt
+          echo "APP_PACKAGE is now:"
+          grep '^APP_PACKAGE' version.txt
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf bison build-essential curl default-jdk \
+            flex gawk git gperf lib32stdc++6 lib32z1 lib32z1-dev \
+            libcurl4-openssl-dev unzip zip zlib1g-dev
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK + NDK r28c
+        run: |
+          mkdir -p "$SDK_ROOT"
+          cd /tmp
+          # שם הקובץ של cmdline-tools משתנה מדי פעם — עדכן אם נכשל
+          curl -fSL -o cmdline-tools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline-tools.zip -d "$SDK_ROOT"
+          SM="$SDK_ROOT/cmdline-tools/bin/sdkmanager"
+          yes | "$SM" --sdk_root="$SDK_ROOT" --licenses
+          "$SM" --sdk_root="$SDK_ROOT" "platform-tools" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkey -keystore ~/.android/debug.keystore -v \
+            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" \
+            -keypass android -storepass android -keyalg RSA -keysize 2048 \
+            -validity 10000 || true
+
+      - name: Cache depends
+        uses: actions/cache@v4
+        with:
+          path: |
+            android-tools/xbmc-tarballs
+            android-tools/xbmc-depends
+          key: depends-aarch64-${{ hashFiles('tools/depends/**') }}
+
+      - name: Configure & build depends
+        run: |
+          cd tools/depends
+          ./bootstrap
+          ./configure --with-tarballs="$TARBALLS" \
+            --host=aarch64-linux-android --with-sdk-path="$SDK_ROOT" \
+            --prefix="$DEPENDS"
+          make -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Build & package Kodi
+        run: |
+          make -C tools/depends/target/cmakebuildsys \
+            BUILD_DIR="$GITHUB_WORKSPACE/kodi-build"
+          cd "$GITHUB_WORKSPACE/kodi-build"
+          make -j$(getconf _NPROCESSORS_ONLN)
+          make apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodi-android-apk
+          path: '**/*.apk'
